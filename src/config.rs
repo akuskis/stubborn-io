@@ -2,7 +2,12 @@
 //! specifically related to reconnect behavior.
 
 use crate::strategies::ExpBackoffStrategy;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 pub type DurationIterator = Box<dyn Iterator<Item = Duration> + Send + Sync>;
 
@@ -24,6 +29,9 @@ pub struct ReconnectOptions {
 
     /// Invoked when the StubbornIo fails a connection attempt
     pub on_connect_fail_callback: Box<dyn Fn() + Send + Sync>,
+
+    // Optional external cancel token to interrupt reconnection attempts
+    pub cancel_token: Option<ReconnectCancelToken>,
 }
 
 impl ReconnectOptions {
@@ -38,6 +46,7 @@ impl ReconnectOptions {
             on_connect_callback: Box::new(|| {}),
             on_disconnect_callback: Box::new(|| {}),
             on_connect_fail_callback: Box::new(|| {}),
+            cancel_token: None,
         }
     }
 
@@ -88,5 +97,44 @@ impl ReconnectOptions {
     pub fn with_on_connect_fail_callback(mut self, cb: impl Fn() + 'static + Send + Sync) -> Self {
         self.on_connect_fail_callback = Box::new(cb);
         self
+    }
+
+    pub fn with_cancel_token(mut self, token: ReconnectCancelToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReconnectCancelToken {
+    notified: Arc<Notify>,
+    is_cancelled: Arc<AtomicBool>,
+}
+
+impl ReconnectCancelToken {
+    pub fn new() -> Self {
+        Self {
+            notified: Arc::new(Notify::new()),
+            is_cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.is_cancelled.store(true, Ordering::SeqCst);
+        self.notified.notify_waiters();
+    }
+
+    pub fn notified(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let n = self.notified.clone();
+        let already_cancelled = self.is_cancelled.load(Ordering::SeqCst);
+        async move {
+            if !already_cancelled {
+                n.notified().await;
+            }
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.is_cancelled.load(Ordering::SeqCst)
     }
 }
